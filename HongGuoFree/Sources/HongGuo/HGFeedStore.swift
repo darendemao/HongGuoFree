@@ -85,20 +85,64 @@ struct HGDiscoverResponse: Decodable {
 // MARK: - 客户端扩展
 
 extension HGServerClient {
-    /// 发现页：拉真实短剧列表
+    /// 红果鉴服务 /rank 榜单返回结构
+    private struct HGRankItemRaw: Decodable {
+        var rank: Int?
+        var seriesID: String?
+        var title: String?
+        var episodeCnt: Int?
+        var score: String?
+        var playCnt: Int?
+        var cover: String?
+        var intro: String?
+
+        enum CodingKeys: String, CodingKey {
+            case rank, title, score, cover, intro
+            case seriesID = "series_id"
+            case episodeCnt = "episode_cnt"
+            case playCnt = "play_cnt"
+        }
+    }
+
+    private struct HGRankResponse: Decodable {
+        var board: String?
+        var name: String?
+        var items: [HGRankItemRaw]?
+    }
+
+    /// 发现页：走红果鉴服务的 /rank 榜单接口（tab 映射到 board）
+    /// 201 推荐 → recommend，202 热播 → hot，203 榜单 → recommend，204 新剧 → new
     func discover(tab: Int = 201, offset: Int = 0, count: Int = 20) async throws -> HGDiscoverResponse {
-        let path = "/api/discover?tab=\(tab)&offset=\(offset)&count=\(count)"
-        guard let url = absolute(path) else { throw HGServeError.notConfigured }
+        guard let base = config.normalized else { throw HGServeError.notConfigured }
+        var baseStr = base.absoluteString
+        while baseStr.hasSuffix("/") { baseStr.removeLast() }
+
+        let board: String
+        switch tab {
+        case 202: board = "hot"
+        case 204: board = "new"
+        default:  board = "recommend"
+        }
+
+        var items = [
+            URLQueryItem(name: "board", value: board),
+            URLQueryItem(name: "limit", value: String(count)),
+        ]
+        if !config.token.isEmpty {
+            items.append(URLQueryItem(name: "api_key", value: config.token))
+        }
+        guard var comps = URLComponents(string: baseStr + "/rank") else {
+            throw HGServeError.badPath("/rank")
+        }
+        comps.queryItems = items
+        guard let url = comps.url else { throw HGServeError.badPath("/rank") }
 
         var req = URLRequest(url: url)
         req.timeoutInterval = 40
         req.setValue("application/json", forHTTPHeaderField: "Accept")
-        if !config.token.isEmpty {
-            req.setValue(config.token, forHTTPHeaderField: "X-Auth-Token")
-        }
 
         do {
-            let (data, response) = try await URLSession.shared.data(for: req)
+            let (data, response) = try await Self.session.data(for: req)
             guard let http = response as? HTTPURLResponse else {
                 throw HGServeError.decode("不是 HTTP 响应")
             }
@@ -106,7 +150,26 @@ extension HGServerClient {
                 let msg = String(data: data, encoding: .utf8) ?? ""
                 throw HGServeError.http(http.statusCode, String(msg.prefix(200)))
             }
-            return try JSONDecoder().decode(HGDiscoverResponse.self, from: data)
+            let raw = try JSONDecoder().decode(HGRankResponse.self, from: data)
+            let mapped = (raw.items ?? []).map { it -> HGFeedItem in
+                HGFeedItem(
+                    seriesID: it.seriesID ?? "",
+                    itemID: nil,
+                    title: it.title,
+                    cover: it.cover,
+                    intro: it.intro,
+                    tags: nil,
+                    episodeText: nil,
+                    episodeCount: it.episodeCnt,
+                    freeEpisodes: nil,
+                    playCount: it.playCnt,
+                    followedCount: nil
+                )
+            }.filter { !$0.seriesID.isEmpty }
+            return HGDiscoverResponse(
+                ok: true, tab: tab, offset: 0, count: mapped.count,
+                hasMore: false, nextOffset: nil, items: mapped
+            )
         } catch let e as HGServeError {
             throw e
         } catch {
@@ -218,33 +281,9 @@ struct HGSearchResponse: Decodable {
 
 extension HGServerClient {
     func search(_ query: String, page: Int = 1) async throws -> HGSearchResponse {
-        guard let base = config.normalized else { throw HGServeError.notConfigured }
-        var baseStr = base.absoluteString
-        while baseStr.hasSuffix("/") { baseStr.removeLast() }
-
-        guard var comps = URLComponents(string: baseStr + "/api/search") else {
-            throw HGServeError.badPath("/api/search")
-        }
-        var items = [URLQueryItem(name: "q", value: query)]
-        if page > 1 { items.append(URLQueryItem(name: "page", value: String(page))) }
-        if !config.token.isEmpty {
-            items.append(URLQueryItem(name: "token", value: config.token))
-        }
-        comps.queryItems = items
-        guard let url = comps.url else { throw HGServeError.badPath("/api/search") }
-
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 30
-        req.setValue("application/json", forHTTPHeaderField: "Accept")
-        if !config.token.isEmpty {
-            req.setValue(config.token, forHTTPHeaderField: "X-Auth-Token")
-        }
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
-            let msg = String(data: data, encoding: .utf8) ?? ""
-            throw HGServeError.http((resp as? HTTPURLResponse)?.statusCode ?? -1,
-                                    String(msg.prefix(160)))
-        }
-        return try JSONDecoder().decode(HGSearchResponse.self, from: data)
+        // 搜索接口（/reading/bookapi/search/tab/v）当前签名后返回空 body，
+        // 与播放一样卡在 device_register。这里明确抛「搜索暂不可用」，
+        // 避免 App 打旧 /api/search 404。可先用首页榜单浏览。
+        throw HGServeError.http(110001, "搜索暂不可用（红果风控，需补设备注册）。请先用首页榜单浏览。")
     }
 }

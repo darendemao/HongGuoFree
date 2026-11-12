@@ -57,35 +57,9 @@ struct HGKeyBundle: Decodable {
 
 extension HGServerClient {
     func keys(vid: String) async throws -> HGKeyBundle {
-        guard let base = config.normalized else { throw HGServeError.notConfigured }
-        var baseStr = base.absoluteString
-        while baseStr.hasSuffix("/") { baseStr.removeLast() }
-
-        guard var comps = URLComponents(string: baseStr + "/api/keys") else {
-            throw HGServeError.badPath("/api/keys")
-        }
-        var items = [URLQueryItem(name: "vid", value: vid)]
-        if !config.token.isEmpty {
-            items.append(URLQueryItem(name: "token", value: config.token))
-        }
-        comps.queryItems = items
-        guard let url = comps.url else { throw HGServeError.badPath("/api/keys") }
-
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 45
-        req.setValue("application/json", forHTTPHeaderField: "Accept")
-        req.setValue("gzip", forHTTPHeaderField: "Accept-Encoding")
-        if !config.token.isEmpty {
-            req.setValue(config.token, forHTTPHeaderField: "X-Auth-Token")
-        }
-
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
-            let msg = String(data: data, encoding: .utf8) ?? ""
-            throw HGServeError.http((resp as? HTTPURLResponse)?.statusCode ?? -1,
-                                    String(msg.prefix(160)))
-        }
-        return try JSONDecoder().decode(HGKeyBundle.self, from: data)
+        // 播放解密依赖红果鉴服务的 multi_video_model（含 spade_a），
+        // 当前卡在 device_register，无法产出密钥。直接抛「未就绪」。
+        throw HGServeError.http(110001, "播放服务暂未就绪（需补设备注册，方案2）")
     }
 }
 

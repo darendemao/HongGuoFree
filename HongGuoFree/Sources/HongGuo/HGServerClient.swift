@@ -152,15 +152,80 @@ struct HGServerClient {
         return URL(string: full)
     }
 
-    // MARK: 剧集详情
+    // MARK: 剧集详情（走红果鉴 rgsngdha 服务的 /episodes 接口）
+
+    /// 红果鉴服务的分集返回结构（/episodes）
+    private struct HGEpisodeRaw: Decodable {
+        var index: Int
+        var vid: String
+        var title: String?
+        var duration: Int?
+        var cover: String?
+    }
+
+    private struct HGEpisodesMetaRaw: Decodable {
+        var seriesID: String?
+        var title: String?
+        var intro: String?
+        var cover: String?
+        var episodeCnt: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case seriesID = "series_id"
+            case title, intro, cover
+            case episodeCnt = "episode_cnt"
+        }
+    }
+
+    private struct HGEpisodesResponse: Decodable {
+        var meta: HGEpisodesMetaRaw?
+        var episodes: [HGEpisodeRaw]?
+    }
 
     func detail(seriesID: String) async throws -> HGServerDetail {
-        let path = "/api/detail?series_id=\(seriesID)"
-        let data = try await get(path)
+        // 走红果鉴服务：GET /episodes?series_id=xxx&api_key=token
+        guard let base = config.normalized else { throw HGServeError.notConfigured }
+        var baseStr = base.absoluteString
+        while baseStr.hasSuffix("/") { baseStr.removeLast() }
+
+        var items = [URLQueryItem(name: "series_id", value: seriesID)]
+        if !config.token.isEmpty {
+            items.append(URLQueryItem(name: "api_key", value: config.token))
+        }
+        guard var comps = URLComponents(string: baseStr + "/episodes") else {
+            throw HGServeError.badPath("/episodes")
+        }
+        comps.queryItems = items
+        guard let url = comps.url else { throw HGServeError.badPath("/episodes") }
+
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 40
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+
         do {
-            let d = try JSONDecoder().decode(HGServerDetail.self, from: data)
-            guard d.ok else { throw HGServeError.decode("ok=false") }
-            return d
+            let (data, response) = try await Self.session.data(for: req)
+            guard let http = response as? HTTPURLResponse else {
+                throw HGServeError.decode("不是 HTTP 响应")
+            }
+            guard (200...299).contains(http.statusCode) else {
+                let msg = String(data: data, encoding: .utf8) ?? ""
+                throw HGServeError.http(http.statusCode, String(msg.prefix(200)))
+            }
+            let raw = try JSONDecoder().decode(HGEpisodesResponse.self, from: data)
+            let meta = raw.meta
+            let eps = (raw.episodes ?? []).map {
+                HGServerEpisode(index: $0.index, vid: $0.vid, playable: true, playURL: nil)
+            }
+            return HGServerDetail(
+                ok: true,
+                seriesID: meta?.seriesID ?? seriesID,
+                title: meta?.title,
+                intro: meta?.intro,
+                cover: meta?.cover,
+                freeEpisodes: meta?.episodeCnt,
+                totalEpisodes: meta?.episodeCnt ?? eps.count,
+                episodes: eps
+            )
         } catch let e as HGServeError {
             throw e
         } catch {
@@ -168,30 +233,22 @@ struct HGServerClient {
         }
     }
 
-    // MARK: 单集信息
+    // MARK: 单集信息（走红果鉴服务 /play，注意：当前 device_register 未就绪，会返回 110001）
 
     func play(vid: String) async throws -> HGServerPlay {
-        let path = "/api/play?vid=\(vid)"
-        let data = try await get(path)
-        do {
-            let p = try JSONDecoder().decode(HGServerPlay.self, from: data)
-            guard p.ok else { throw HGServeError.decode("ok=false") }
-            return p
-        } catch let e as HGServeError {
-            throw e
-        } catch {
-            throw HGServeError.decode(error.localizedDescription)
-        }
+        // 红果鉴服务 /play 接口需要 series_id + ep，这里退化为返回「未就绪」状态，
+        // 避免 App 因旧 /api/play 404 报错。真实播放能力需补 device_register 后恢复。
+        throw HGServeError.http(110001, "播放服务暂未就绪（需补设备注册，方案2）")
     }
 
     // MARK: 可直接给 AVPlayer 的 URL
 
     /// 服务端解密后的流地址（支持 Range，AVPlayer 直接播）
+    ///
+    /// 注意：红果鉴服务的播放接口（multi_video_model）当前卡在 device_register，
+    /// 无法产出可播流。这里直接抛错，让播放器走「未就绪」提示。
     func streamURL(vid: String) throws -> URL {
-        guard let url = absolute("/api/stream?vid=\(vid)") else {
-            throw HGServeError.notConfigured
-        }
-        return url
+        throw HGServeError.http(110001, "播放服务暂未就绪（需补设备注册，方案2）")
     }
 
     /// 完整下载地址
@@ -206,11 +263,10 @@ struct HGServerClient {
 
     @discardableResult
     func health() async -> Bool {
+        // 新服务根路径返回 {"service":...,"endpoints":[...]}（非 {ok:true}），
+        // 这里只要 HTTP 200 且是合法 JSON 即视为在线。
         guard let data = try? await get("/") else { return false }
-        guard let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return false
-        }
-        return (j["ok"] as? Bool) ?? false
+        return (try? JSONSerialization.jsonObject(with: data)) != nil
     }
 
     // MARK: 底层
