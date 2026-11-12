@@ -142,7 +142,7 @@ extension HGServerClient {
         req.setValue("application/json", forHTTPHeaderField: "Accept")
 
         do {
-            let (data, response) = try await Self.session.data(for: req)
+            let (data, response) = try await URLSession.shared.data(for: req)
             guard let http = response as? HTTPURLResponse else {
                 throw HGServeError.decode("不是 HTTP 响应")
             }
@@ -151,7 +151,8 @@ extension HGServerClient {
                 throw HGServeError.http(http.statusCode, String(msg.prefix(200)))
             }
             let raw = try JSONDecoder().decode(HGRankResponse.self, from: data)
-            let mapped = (raw.items ?? []).map { it -> HGFeedItem in
+            let sourceItems: [HGRankItemRaw] = raw.items ?? []
+            let mapped = sourceItems.map { it -> HGFeedItem in
                 HGFeedItem(
                     seriesID: it.seriesID ?? "",
                     itemID: nil,
