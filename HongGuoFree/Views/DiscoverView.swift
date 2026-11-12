@@ -1,4 +1,4 @@
-// 发现页：短剧瀑布流 + 搜索 + tab 分类
+// 发现页：推荐 tab 为竖向全屏信息流（红果式），其余分类为瀑布流
 import SwiftUI
 
 struct DiscoverView: View {
@@ -20,16 +20,19 @@ struct DiscoverView: View {
             Group {
                 if !appState.isConfigured {
                     notConfiguredView
+                } else if store.tab == 201 {
+                    // 推荐页：竖向全屏信息流
+                    recommendFeed
                 } else {
                     contentView
                 }
             }
             .navigationTitle("红果短剧")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     NavigationLink {
-                        SearchView()
-                            .environmentObject(appState)
+                        SearchView().environmentObject(appState)
                     } label: {
                         Image(systemName: "magnifyingglass")
                     }
@@ -43,6 +46,28 @@ struct DiscoverView: View {
             Task { await store.reload(config: newConfig) }
         }
     }
+
+    // MARK: 推荐页 —— 竖向全屏信息流
+
+    private var recommendFeed: some View {
+        TabView {
+            ForEach(store.items) { item in
+                RecommendCard(item: item)
+                    .tag(item.id)
+                    .onAppear {
+                        if item.id == store.items.last?.id {
+                            Task { await store.loadMore(config: appState.config) }
+                        }
+                    }
+            }
+        }
+        .tabViewStyle(.page(indexDisplayMode: .never))
+        .refreshable {
+            await store.reload(config: appState.config)
+        }
+    }
+
+    // MARK: 分类页 —— 瀑布流
 
     private var contentView: some View {
         ScrollView {
@@ -125,7 +150,79 @@ struct DiscoverView: View {
     }
 }
 
-// MARK: - 卡片
+// MARK: - 推荐页单屏卡片（全屏封面 + 信息 + 选集入口）
+
+struct RecommendCard: View {
+    @EnvironmentObject private var appState: AppState
+    let item: HGFeedItem
+
+    var body: some View {
+        NavigationLink {
+            DetailView(seriesID: item.seriesID, title: item.title ?? "")
+                .environmentObject(appState)
+        } label: {
+            ZStack(alignment: .bottom) {
+                // 全屏封面
+                RemoteCover(urlString: item.cover)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .clipped()
+                    .overlay(
+                        LinearGradient(
+                            colors: [.clear, .clear, .black.opacity(0.85)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+
+                // 底部信息区
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(item.title ?? "未知剧名")
+                        .font(.title3.weight(.semibold))
+                        .foregroundColor(.white)
+                        .lineLimit(2)
+
+                    HStack(spacing: 10) {
+                        if !item.episodeTextResolved.isEmpty {
+                            Text(item.episodeTextResolved)
+                                .font(.caption)
+                                .foregroundColor(.white.opacity(0.9))
+                        }
+                        if !item.playText.isEmpty {
+                            Text(item.playText)
+                                .font(.caption)
+                                .foregroundColor(.white.opacity(0.9))
+                        }
+                    }
+
+                    if let intro = item.intro, !intro.isEmpty {
+                        Text(intro)
+                            .font(.footnote)
+                            .foregroundColor(.white.opacity(0.75))
+                            .lineLimit(2)
+                    }
+
+                    // 选集/观看按钮
+                    HStack(spacing: 12) {
+                        Label("选集观看", systemImage: "play.fill")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 10)
+                            .background(Color.red)
+                            .clipShape(Capsule())
+
+                        Spacer()
+                    }
+                }
+                .padding(.horizontal, 20)
+                .padding(.bottom, 40)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: - 瀑布流卡片
 
 struct FeedCard: View {
     let item: HGFeedItem

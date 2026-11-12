@@ -79,9 +79,9 @@ struct DetailView: View {
         let eps = d.episodes ?? []
         return LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 5),
                          spacing: 10) {
-            ForEach(eps) { ep in
+            ForEach(Array(eps.enumerated()), id: \.element.id) { idx, ep in
                 NavigationLink {
-                    PlayerView(vid: ep.vid, title: "\(d.title ?? title) 第\(ep.index)集")
+                    PlayerView(episodes: eps, initialIndex: idx, title: d.title ?? title)
                         .environmentObject(appState)
                 } label: {
                     Text("\(ep.index)")
