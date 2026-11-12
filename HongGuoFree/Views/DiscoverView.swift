@@ -74,6 +74,7 @@ struct DiscoverView: View {
         }
     }
 
+    @ViewBuilder
     private var grid: some View {
         LazyVGrid(columns: [
             GridItem(.flexible(), spacing: 12),
