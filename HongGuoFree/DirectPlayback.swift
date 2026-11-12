@@ -56,10 +56,15 @@ struct HGKeyBundle: Decodable {
 // MARK: - 客户端
 
 extension HGServerClient {
+    /// 走服务端 /api/keys，返回直连播放所需的密钥包（key / header / 每样本 IV / 空洞）
     func keys(vid: String) async throws -> HGKeyBundle {
-        // 播放解密依赖红果鉴服务的 multi_video_model（含 spade_a），
-        // 当前卡在 device_register，无法产出密钥。直接抛「未就绪」。
-        throw HGServeError.http(110001, "播放服务暂未就绪（需补设备注册，方案2）")
+        let url = try apiURL("/api/keys", query: [("vid", vid)])
+        let data = try await requestData(url: url, timeout: 40)
+        do {
+            return try JSONDecoder().decode(HGKeyBundle.self, from: data)
+        } catch {
+            throw HGServeError.decode(error.localizedDescription)
+        }
     }
 }
 

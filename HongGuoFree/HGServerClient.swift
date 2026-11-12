@@ -4,10 +4,40 @@
 //   红果接口签名绕过 -> 拿 1080P 地址 -> CENC 逐样本解密 -> HTTP Range 输出明文 MP4
 // iOS 端只做一件事：把它当成普通视频 URL 播。
 //
+// 两种播放模式：
+//   .proxy  转发模式 —— 视频流量走服务器 /api/stream（简单，吃服务器带宽）
+//   .direct 直连模式 —— App 直连红果 CDN + 本地解密（省带宽，需 /api/keys）
+//
 // 部署后把 baseURL 填成你的服务器地址即可，例如：
 //   http://192.168.1.10:8787      （局域网）
 //   https://hg.example.com        （公网，建议套 HTTPS + ACCESS_TOKEN）
 import Foundation
+
+// MARK: - 播放模式
+
+/// 播放模式：转发（服务器解密后转发）或直连（App 自己解 CENC）
+enum HGPlaybackMode: String, Codable, CaseIterable, Identifiable {
+    case proxy
+    case direct
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .proxy: return "转发模式"
+        case .direct: return "直连模式"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .proxy:
+            return "视频流量走服务器解密后转发，简单稳定，但消耗服务器带宽。"
+        case .direct:
+            return "App 直连红果 CDN 并本地解密，省服务器带宽（约省 30 倍）。"
+        }
+    }
+}
 
 // MARK: - 配置
 
@@ -15,8 +45,15 @@ import Foundation
 struct ResolverConfig: Codable, Equatable {
     var baseURL: String
     var token: String
+    var mode: HGPlaybackMode
 
-    static let `default` = ResolverConfig(baseURL: "", token: "")
+    static let `default` = ResolverConfig(baseURL: "", token: "", mode: .proxy)
+
+    init(baseURL: String, token: String, mode: HGPlaybackMode = .proxy) {
+        self.baseURL = baseURL
+        self.token = token
+        self.mode = mode
+    }
 
     var normalized: URL? {
         var s = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -37,12 +74,14 @@ struct HGServerEpisode: Decodable, Identifiable {
     var index: Int
     var vid: String
     var playable: Bool?
+    var title: String?
+    var duration: Int?
     var playURL: String?
 
     var id: String { vid }
 
     enum CodingKeys: String, CodingKey {
-        case index, vid, playable
+        case index, vid, playable, title, duration
         case playURL = "play_url"
     }
 }
@@ -152,103 +191,32 @@ struct HGServerClient {
         return URL(string: full)
     }
 
-    // MARK: 剧集详情（走红果鉴 rgsngdha 服务的 /episodes 接口）
+    // MARK: 剧集详情
 
-    /// 红果鉴服务的分集返回结构（/episodes）
-    private struct HGEpisodeRaw: Decodable {
-        var index: Int
-        var vid: String
-        var title: String?
-        var duration: Int?
-        var cover: String?
-    }
-
-    private struct HGEpisodesMetaRaw: Decodable {
-        var seriesID: String?
-        var title: String?
-        var intro: String?
-        var cover: String?
-        var episodeCnt: Int?
-
-        enum CodingKeys: String, CodingKey {
-            case seriesID = "series_id"
-            case title, intro, cover
-            case episodeCnt = "episode_cnt"
-        }
-    }
-
-    private struct HGEpisodesResponse: Decodable {
-        var meta: HGEpisodesMetaRaw?
-        var episodes: [HGEpisodeRaw]?
-    }
-
+    /// 走服务端 /api/detail，返回完整详情 + 分集清单
     func detail(seriesID: String) async throws -> HGServerDetail {
-        // 走红果鉴服务：GET /episodes?series_id=xxx&api_key=token
-        guard let base = config.normalized else { throw HGServeError.notConfigured }
-        var baseStr = base.absoluteString
-        while baseStr.hasSuffix("/") { baseStr.removeLast() }
-
-        var items = [URLQueryItem(name: "series_id", value: seriesID)]
-        if !config.token.isEmpty {
-            items.append(URLQueryItem(name: "api_key", value: config.token))
-        }
-        guard var comps = URLComponents(string: baseStr + "/episodes") else {
-            throw HGServeError.badPath("/episodes")
-        }
-        comps.queryItems = items
-        guard let url = comps.url else { throw HGServeError.badPath("/episodes") }
-
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 40
-        req.setValue("application/json", forHTTPHeaderField: "Accept")
-
-        do {
-            let (data, response) = try await Self.session.data(for: req)
-            guard let http = response as? HTTPURLResponse else {
-                throw HGServeError.decode("不是 HTTP 响应")
-            }
-            guard (200...299).contains(http.statusCode) else {
-                let msg = String(data: data, encoding: .utf8) ?? ""
-                throw HGServeError.http(http.statusCode, String(msg.prefix(200)))
-            }
-            let raw = try JSONDecoder().decode(HGEpisodesResponse.self, from: data)
-            let meta = raw.meta
-            let eps = (raw.episodes ?? []).map {
-                HGServerEpisode(index: $0.index, vid: $0.vid, playable: true, playURL: nil)
-            }
-            return HGServerDetail(
-                ok: true,
-                seriesID: meta?.seriesID ?? seriesID,
-                title: meta?.title,
-                intro: meta?.intro,
-                cover: meta?.cover,
-                freeEpisodes: meta?.episodeCnt,
-                totalEpisodes: meta?.episodeCnt ?? eps.count,
-                episodes: eps
-            )
-        } catch let e as HGServeError {
-            throw e
-        } catch {
-            throw HGServeError.decode(error.localizedDescription)
-        }
+        let url = try apiURL("/api/detail", query: [("series_id", seriesID)])
+        let data = try await requestData(url: url, timeout: 40)
+        return try decodeOrThrow(HGServerDetail.self, data)
     }
 
-    // MARK: 单集信息（走红果鉴服务 /play，注意：当前 device_register 未就绪，会返回 110001）
+    // MARK: 单集信息
 
+    /// 走服务端 /api/play，返回播放模型（质量 / 时长 / 是否 CENC / 密钥等）
     func play(vid: String) async throws -> HGServerPlay {
-        // 红果鉴服务 /play 接口需要 series_id + ep，这里退化为返回「未就绪」状态，
-        // 避免 App 因旧 /api/play 404 报错。真实播放能力需补 device_register 后恢复。
-        throw HGServeError.http(110001, "播放服务暂未就绪（需补设备注册，方案2）")
+        let url = try apiURL("/api/play", query: [("vid", vid)])
+        let data = try await requestData(url: url, timeout: 40)
+        return try decodeOrThrow(HGServerPlay.self, data)
     }
 
-    // MARK: 可直接给 AVPlayer 的 URL
+    // MARK: 可直接给 AVPlayer 的 URL（转发模式）
 
     /// 服务端解密后的流地址（支持 Range，AVPlayer 直接播）
-    ///
-    /// 注意：红果鉴服务的播放接口（multi_video_model）当前卡在 device_register，
-    /// 无法产出可播流。这里直接抛错，让播放器走「未就绪」提示。
     func streamURL(vid: String) throws -> URL {
-        throw HGServeError.http(110001, "播放服务暂未就绪（需补设备注册，方案2）")
+        guard let url = absolute("/api/stream?vid=\(vid)") else {
+            throw HGServeError.notConfigured
+        }
+        return url
     }
 
     /// 完整下载地址
@@ -263,7 +231,7 @@ struct HGServerClient {
 
     @discardableResult
     func health() async -> Bool {
-        // 新服务根路径返回 {"service":...,"endpoints":[...]}（非 {ok:true}），
+        // 服务端根路径返回 {"service":...,"endpoints":[...]}（非 {ok:true}），
         // 这里只要 HTTP 200 且是合法 JSON 即视为在线。
         guard let data = try? await get("/") else { return false }
         return (try? JSONSerialization.jsonObject(with: data)) != nil
@@ -271,9 +239,34 @@ struct HGServerClient {
 
     // MARK: 底层
 
+    /// 用 query 参数构造 /api 接口 URL（自动带上 token）
+    /// 注意：必须用 internal（不能 private），因为其它文件的 extension 也要调用。
+    func apiURL(_ path: String, query: [(String, String)]) throws -> URL {
+        guard let base = config.normalized else { throw HGServeError.notConfigured }
+        var baseStr = base.absoluteString
+        while baseStr.hasSuffix("/") { baseStr.removeLast() }
+
+        var comps = URLComponents(string: baseStr + path)
+        var items = comps?.queryItems ?? []
+        for (k, v) in query {
+            items.append(URLQueryItem(name: k, value: v))
+        }
+        if !config.token.isEmpty {
+            items.append(URLQueryItem(name: "token", value: config.token))
+        }
+        comps?.queryItems = items
+        guard let url = comps?.url else { throw HGServeError.badPath(path) }
+        return url
+    }
+
     private func get(_ path: String) async throws -> Data {
         guard let url = absolute(path) else { throw HGServeError.notConfigured }
+        return try await requestData(url: url, timeout: 30)
+    }
+
+    func requestData(url: URL, timeout: TimeInterval) async throws -> Data {
         var req = URLRequest(url: url)
+        req.timeoutInterval = timeout
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         if !config.token.isEmpty {
             req.setValue(config.token, forHTTPHeaderField: "X-Auth-Token")
@@ -292,6 +285,14 @@ struct HGServerClient {
             throw e
         } catch {
             throw HGServeError.http(-1, error.localizedDescription)
+        }
+    }
+
+    private func decodeOrThrow<T: Decodable>(_ type: T.Type, _ data: Data) throws -> T {
+        do {
+            return try JSONDecoder().decode(T.self, from: data)
+        } catch {
+            throw HGServeError.decode(error.localizedDescription)
         }
     }
 }
